@@ -1,26 +1,40 @@
 """
-RAG service – Chroma (HTTP) + OpenAI embeddings + recursive chunking.
+RAG service – Chroma (HTTP) + OpenAI embeddings + async-friendly chunking.
+
+Performance notes
+-----------------
+* Chunking is pure CPU; we offload it with asyncio.to_thread so the
+  FastAPI event loop is never blocked.
+* Embeddings use AsyncOpenAI and are sent in batches (default 64).
+* Chroma HTTP calls are still sync; we also wrap them in to_thread.
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import uuid
 from typing import Any, Optional
 
 import chromadb
-from openai import OpenAI
+from openai import AsyncOpenAI, OpenAI
 
 logger = logging.getLogger(__name__)
+
+# OpenAI embedding API accepts up to ~2048 inputs; stay conservative.
+_EMBED_BATCH_SIZE = int(os.getenv("EMBED_BATCH_SIZE", "64"))
 
 
 class RAGService:
     def __init__(self) -> None:
-        self.openai = OpenAI(
-            api_key=os.getenv("OPENAI_API_KEY"),
-            base_url=os.getenv("OPENAI_BASE_URL") or None,
-        )
+        api_key = os.getenv("OPENAI_API_KEY")
+        base_url = os.getenv("OPENAI_BASE_URL") or None
+
+        # Sync client kept for rare non-async paths / health probes
+        self.openai = OpenAI(api_key=api_key, base_url=base_url)
+        self.async_openai = AsyncOpenAI(api_key=api_key, base_url=base_url)
+
         self.embedding_model = os.getenv(
             "EMBEDDING_MODEL", "text-embedding-3-small"
         )
@@ -30,6 +44,9 @@ class RAGService:
         self._client: Optional[chromadb.HttpClient] = None
         self._collection = None
 
+    # ------------------------------------------------------------------
+    # Chroma connection (lazy)
+    # ------------------------------------------------------------------
     def _connect(self) -> bool:
         if self._collection is not None:
             return True
@@ -63,54 +80,137 @@ class RAGService:
             return 0
         return self._collection.count()
 
+    # ------------------------------------------------------------------
+    # Chunking – iterative (no recursion), O(n) over characters
+    # ------------------------------------------------------------------
     def _split(self, text: str) -> list[str]:
+        """
+        Recursive-*style* splitter implemented iteratively.
+
+        Prefers larger semantic boundaries first:
+            paragraph → line → sentence → word → character
+
+        Overlap is applied between consecutive chunks so retrieval
+        does not lose context at boundaries.
+        """
         if not text or not text.strip():
             return []
 
+        size = self.chunk_size
+        overlap = min(self.chunk_overlap, size // 2)
         separators = ["\n\n", "\n", ". ", " ", ""]
-        chunks: list[str] = []
 
-        def _recurse(t: str, seps: list[str]) -> None:
-            if len(t) <= self.chunk_size:
-                if t.strip():
-                    chunks.append(t.strip())
-                return
-            sep = seps[0] if seps else ""
-            parts = t.split(sep) if sep else list(t)
+        def split_once(t: str, sep: str) -> list[str]:
+            if not sep:
+                return [t[i : i + size] for i in range(0, len(t), size)]
+            return t.split(sep)
+
+        def merge_parts(parts: list[str], sep: str) -> list[str]:
+            """Greedily pack parts into chunks ≤ size."""
+            out: list[str] = []
             current = ""
             for part in parts:
                 candidate = (current + sep + part) if current else part
-                if len(candidate) <= self.chunk_size:
+                if len(candidate) <= size:
                     current = candidate
                 else:
                     if current:
-                        chunks.append(current.strip())
-                    if len(part) > self.chunk_size and len(seps) > 1:
-                        _recurse(part, seps[1:])
+                        out.append(current)
+                    if len(part) > size:
+                        out.append(part)  # refined by a finer separator later
                         current = ""
                     else:
                         current = part
-            if current.strip():
-                if chunks and self.chunk_overlap > 0:
-                    prev = chunks[-1]
-                    overlap = prev[-self.chunk_overlap :] if len(prev) > self.chunk_overlap else prev
-                    if not current.startswith(overlap):
-                        current = overlap + " " + current
-                chunks.append(current.strip())
+            if current:
+                out.append(current)
+            return out
 
-        _recurse(text, separators)
-        return [c for c in chunks if c]
+        # Start with the whole text; progressively refine oversized pieces
+        pieces = [text]
+        for sep in separators:
+            next_pieces: list[str] = []
+            for piece in pieces:
+                if len(piece) <= size:
+                    next_pieces.append(piece)
+                else:
+                    parts = split_once(piece, sep)
+                    next_pieces.extend(merge_parts(parts, sep))
+            pieces = next_pieces
 
-    def _embed(self, texts: list[str]) -> list[list[float]]:
+        # Final hard-cut for any remaining giants + strip empties
+        raw: list[str] = []
+        for p in pieces:
+            p = p.strip()
+            if not p:
+                continue
+            if len(p) <= size:
+                raw.append(p)
+            else:
+                for i in range(0, len(p), size):
+                    chunk = p[i : i + size].strip()
+                    if chunk:
+                        raw.append(chunk)
+
+        if not raw:
+            return []
+
+        # Apply overlap
+        if overlap <= 0 or len(raw) == 1:
+            return raw
+
+        overlapped: list[str] = [raw[0]]
+        for i in range(1, len(raw)):
+            prev = overlapped[-1]
+            tail = prev[-overlap:] if len(prev) > overlap else prev
+            nxt = raw[i]
+            if not nxt.startswith(tail):
+                nxt = (tail + " " + nxt).strip()
+            # Guard against accidental bloat past 1.5× size
+            if len(nxt) > size + overlap:
+                nxt = nxt[-(size + overlap) :]
+            overlapped.append(nxt)
+
+        return overlapped
+
+    async def split_async(self, text: str) -> list[str]:
+        """Run CPU-bound splitting off the event loop."""
+        return await asyncio.to_thread(self._split, text)
+
+    # ------------------------------------------------------------------
+    # Embeddings – async + batched
+    # ------------------------------------------------------------------
+    async def _embed_async(self, texts: list[str]) -> list[list[float]]:
         if not texts:
             return []
-        resp = self.openai.embeddings.create(
-            model=self.embedding_model,
-            input=texts,
-        )
-        return [d.embedding for d in resp.data]
 
-    def ingest(
+        vectors: list[list[float]] = []
+        for i in range(0, len(texts), _EMBED_BATCH_SIZE):
+            batch = texts[i : i + _EMBED_BATCH_SIZE]
+            resp = await self.async_openai.embeddings.create(
+                model=self.embedding_model,
+                input=batch,
+            )
+            vectors.extend(d.embedding for d in resp.data)
+        return vectors
+
+    def _embed(self, texts: list[str]) -> list[list[float]]:
+        """Sync fallback (tests / scripts). Prefer _embed_async in request path."""
+        if not texts:
+            return []
+        vectors: list[list[float]] = []
+        for i in range(0, len(texts), _EMBED_BATCH_SIZE):
+            batch = texts[i : i + _EMBED_BATCH_SIZE]
+            resp = self.openai.embeddings.create(
+                model=self.embedding_model,
+                input=batch,
+            )
+            vectors.extend(d.embedding for d in resp.data)
+        return vectors
+
+    # ------------------------------------------------------------------
+    # Ingest
+    # ------------------------------------------------------------------
+    async def ingest(
         self,
         text: str,
         source: str = "upload",
@@ -119,11 +219,14 @@ class RAGService:
         if not self._connect() or self._collection is None:
             raise RuntimeError("Chroma is not available")
 
-        chunks = self._split(text)
+        # 1. Chunk off the event loop
+        chunks = await self.split_async(text)
         if not chunks:
             raise ValueError("No content to ingest")
 
-        embeddings = self._embed(chunks)
+        # 2. Embed in batches (already async I/O)
+        embeddings = await self._embed_async(chunks)
+
         ids = [str(uuid.uuid4()) for _ in chunks]
         metas = [
             {
@@ -135,36 +238,55 @@ class RAGService:
             for i in range(len(chunks))
         ]
 
-        self._collection.add(
-            ids=ids,
-            documents=chunks,
-            embeddings=embeddings,
-            metadatas=metas,
+        # 3. Chroma write is sync HTTP – keep it off the loop
+        def _add() -> int:
+            assert self._collection is not None
+            self._collection.add(
+                ids=ids,
+                documents=chunks,
+                embeddings=embeddings,
+                metadatas=metas,
+            )
+            return self._collection.count()
+
+        total = await asyncio.to_thread(_add)
+        logger.info(
+            "Ingested %d chunks from %s (kb=%d)", len(chunks), source, total
         )
         return {
             "source": source,
             "chunks": len(chunks),
-            "total_docs": self._collection.count(),
+            "total_docs": total,
         }
 
-    def retrieve(self, query: str, k: int = 4) -> list[dict[str, Any]]:
+    # ------------------------------------------------------------------
+    # Retrieve
+    # ------------------------------------------------------------------
+    async def retrieve(self, query: str, k: int = 4) -> list[dict[str, Any]]:
         if not self._connect() or self._collection is None:
             return []
         n = self._collection.count()
         if n == 0:
             return []
 
-        q_emb = self._embed([query])[0]
-        results = self._collection.query(
-            query_embeddings=[q_emb],
-            n_results=min(k, n),
-            include=["documents", "metadatas", "distances"],
-        )
+        q_emb = (await self._embed_async([query]))[0]
+
+        def _query() -> dict:
+            assert self._collection is not None
+            return self._collection.query(
+                query_embeddings=[q_emb],
+                n_results=min(k, n),
+                include=["documents", "metadatas", "distances"],
+            )
+
+        results = await asyncio.to_thread(_query)
 
         docs: list[dict[str, Any]] = []
         if results and results["documents"]:
             for i, doc in enumerate(results["documents"][0]):
-                dist = results["distances"][0][i] if results["distances"] else 1.0
+                dist = (
+                    results["distances"][0][i] if results["distances"] else 1.0
+                )
                 docs.append(
                     {
                         "content": doc,
