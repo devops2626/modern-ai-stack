@@ -1,18 +1,20 @@
 import os
-from typing import Optional, List
+import json
+from typing import Optional, List, AsyncGenerator
 
 from fastapi import FastAPI, HTTPException, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
-from openai import OpenAI, OpenAIError
+from openai import OpenAI, OpenAIError, AsyncOpenAI
 from dotenv import load_dotenv
 
 load_dotenv()
 
 app = FastAPI(
     title="Modern AI Stack API",
-    description="FastAPI backend with optional RAG (Chroma) for document Q&A",
-    version="1.1.0",
+    description="FastAPI backend with SSE streaming + optional RAG (Chroma)",
+    version="1.2.0",
 )
 
 app.add_middleware(
@@ -23,7 +25,10 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Sync client kept for non-streaming / ingest paths
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+# Async client for streaming
+async_client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 
 # --- Optional Chroma client (lazy) ---
@@ -37,12 +42,11 @@ def get_chroma():
         return _chroma_client, _collection
     try:
         import chromadb
-        from chromadb.config import Settings
 
         host = os.getenv("CHROMA_HOST", "localhost")
         port = int(os.getenv("CHROMA_PORT", "8001"))
 
-        # When running inside docker-compose the service name is "chroma" and port is 8000
+        # Inside docker-compose the service name is "chroma" and listens on 8000
         if host == "chroma":
             port = 8000
 
@@ -55,6 +59,34 @@ def get_chroma():
     except Exception as e:
         print(f"[Chroma] not available: {e}")
         return None, None
+
+
+def build_user_content(prompt: str, use_rag: bool) -> tuple[str, bool]:
+    """Optionally augment the prompt with retrieved context."""
+    context_used = False
+    user_content = prompt
+
+    if use_rag:
+        _, collection = get_chroma()
+        if collection is not None:
+            try:
+                results = collection.query(
+                    query_texts=[prompt],
+                    n_results=min(4, max(1, collection.count() or 1)),
+                )
+                docs = results.get("documents", [[]])[0]
+                if docs:
+                    context = "\n\n---\n\n".join(docs)
+                    user_content = (
+                        "Use the following context to answer the question. "
+                        "If the context is insufficient, say so.\n\n"
+                        f"Context:\n{context}\n\nQuestion: {prompt}"
+                    )
+                    context_used = True
+            except Exception as e:
+                print(f"[RAG] query failed: {e}")
+
+    return user_content, context_used
 
 
 class QueryRequest(BaseModel):
@@ -80,36 +112,17 @@ async def health():
         "status": "ok",
         "model": MODEL,
         "chroma": "connected" if chroma_ok else "unavailable",
+        "streaming": True,
     }
 
 
+# ---------- Non-streaming (kept for compatibility / Swagger) ----------
 @app.post("/api/generate", response_model=QueryResponse)
 async def generate_text(request: QueryRequest):
     if not os.getenv("OPENAI_API_KEY"):
         raise HTTPException(status_code=500, detail="OPENAI_API_KEY is not configured")
 
-    context_used = False
-    user_content = request.prompt
-
-    if request.use_rag:
-        _, collection = get_chroma()
-        if collection is not None:
-            try:
-                results = collection.query(
-                    query_texts=[request.prompt],
-                    n_results=min(4, max(1, collection.count() or 1)),
-                )
-                docs = results.get("documents", [[]])[0]
-                if docs:
-                    context = "\n\n---\n\n".join(docs)
-                    user_content = (
-                        f"Use the following context to answer the question. "
-                        f"If the context is insufficient, say so.\n\n"
-                        f"Context:\n{context}\n\nQuestion: {request.prompt}"
-                    )
-                    context_used = True
-            except Exception as e:
-                print(f"[RAG] query failed: {e}")
+    user_content, context_used = build_user_content(request.prompt, request.use_rag)
 
     try:
         response = client.chat.completions.create(
@@ -128,6 +141,59 @@ async def generate_text(request: QueryRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+# ---------- SSE Streaming ----------
+async def event_generator(request: QueryRequest) -> AsyncGenerator[str, None]:
+    """Yield Server-Sent Events as the model generates tokens."""
+    if not os.getenv("OPENAI_API_KEY"):
+        yield f"data: {json.dumps({'error': 'OPENAI_API_KEY is not configured'})}\n\n"
+        return
+
+    user_content, context_used = build_user_content(request.prompt, request.use_rag)
+
+    # First event: metadata
+    yield f"data: {json.dumps({'type': 'meta', 'model': MODEL, 'context_used': context_used})}\n\n"
+
+    try:
+        stream = await async_client.chat.completions.create(
+            model=MODEL,
+            messages=[
+                {"role": "system", "content": request.system},
+                {"role": "user", "content": user_content},
+            ],
+            temperature=0.7,
+            stream=True,
+        )
+
+        async for chunk in stream:
+            delta = chunk.choices[0].delta if chunk.choices else None
+            if delta and delta.content:
+                # Each token as its own SSE event
+                yield f"data: {json.dumps({'type': 'token', 'content': delta.content})}\n\n"
+
+        # Done signal
+        yield f"data: {json.dumps({'type': 'done'})}\n\n"
+
+    except OpenAIError as e:
+        yield f"data: {json.dumps({'type': 'error', 'message': str(e)})}\n\n"
+    except Exception as e:
+        yield f"data: {json.dumps({'type': 'error', 'message': str(e)})}\n\n"
+
+
+@app.post("/api/generate/stream")
+async def generate_stream(request: QueryRequest):
+    """Stream tokens via Server-Sent Events (text/event-stream)."""
+    return StreamingResponse(
+        event_generator(request),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",  # disable nginx buffering if present
+        },
+    )
+
+
+# ---------- Ingest endpoints ----------
 @app.post("/api/ingest")
 async def ingest_text(texts: List[str]):
     """Ingest plain text chunks into the vector store."""
@@ -151,7 +217,6 @@ async def ingest_file(file: UploadFile = File(...)):
         raise HTTPException(status_code=503, detail="Chroma is not available")
 
     content = (await file.read()).decode("utf-8", errors="ignore")
-    # Simple chunking by paragraphs
     chunks = [c.strip() for c in content.split("\n\n") if c.strip()]
     if not chunks:
         chunks = [content[:4000]] if content.strip() else []

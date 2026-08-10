@@ -1,6 +1,6 @@
 # Modern AI Stack
 
-A clean, production-oriented blueprint for building an end-to-end AI application (chat assistant / RAG-ready agent).
+A clean, production-oriented blueprint for building an end-to-end AI application (chat assistant / RAG-ready agent) with **real-time SSE streaming**.
 
 ## Architecture (4 Layers)
 
@@ -9,24 +9,24 @@ A clean, production-oriented blueprint for building an end-to-end AI application
 | 1. Foundation | LLM Provider | OpenAI, Anthropic, Google Gemini | Core intelligence |
 | 2. Infrastructure | Backend & Compute | FastAPI, Docker, Vercel/AWS | API, business logic, hosting |
 | 3. Integration | Orchestration & Data | LangChain / LlamaIndex, **Chroma** | RAG, memory, tools |
-| 4. Application | UI | Next.js, React, Tailwind | Chat UX, streaming, feedback |
+| 4. Application | UI | Next.js, React, Tailwind | Chat UX, **SSE streaming**, feedback |
 
 ## Project Structure
 
 ```
 modern-ai-stack/
 ├── backend/
-│   ├── main.py
+│   ├── main.py                 # FastAPI + SSE + RAG
 │   ├── requirements.txt
 │   ├── Dockerfile
 │   ├── .env.example
 │   └── ...
 ├── frontend/
-│   ├── src/app/page.tsx
+│   ├── src/app/page.tsx        # Streaming chat UI
 │   ├── package.json
 │   ├── Dockerfile
 │   └── ...
-├── docker-compose.yml      # backend + frontend + Chroma
+├── docker-compose.yml          # backend + frontend + Chroma
 ├── .gitignore
 └── README.md
 ```
@@ -40,7 +40,7 @@ cp backend/.env.example backend/.env
 # Edit backend/.env and add your OPENAI_API_KEY
 ```
 
-2. Start the full stack (API + UI + vector DB):
+2. Start the full stack:
 
 ```bash
 docker compose up --build
@@ -55,41 +55,52 @@ docker compose up --build
 
 Stop with `Ctrl+C` or `docker compose down`.
 
-> Source is volume-mounted → hot reload works for both backend and frontend.  
-> Chroma data is persisted in a Docker volume (`chroma_data`).
+## Streaming (SSE)
+
+The chat UI uses **Server-Sent Events** by default.
+
+- Endpoint: `POST /api/generate/stream`
+- Media type: `text/event-stream`
+- Event types:
+  - `meta` — model name + whether RAG context was used
+  - `token` — individual generated tokens
+  - `done` — stream finished
+  - `error` — something went wrong
+
+The classic non-streaming endpoint `POST /api/generate` is still available for scripts / Swagger testing.
+
+Example (curl):
+
+```bash
+curl -N -X POST http://localhost:8000/api/generate/stream \
+  -H "Content-Type: application/json" \
+  -d '{"prompt": "Write a short poem about Docker.", "use_rag": false}'
+```
 
 ## RAG / Document Q&A
 
-The backend talks to the Chroma container automatically.
-
-### 1. Ingest documents
-
-**Plain text chunks** (Swagger or curl):
+### Ingest
 
 ```bash
+# Text chunks
 curl -X POST http://localhost:8000/api/ingest \
   -H "Content-Type: application/json" \
-  -d '["Your first document paragraph.", "Another relevant chunk of knowledge."]'
-```
+  -d '["The capital of Morocco is Rabat.", "Casablanca is the largest city."]'
 
-**Upload a .txt / .md file**:
-
-```bash
+# File upload
 curl -X POST http://localhost:8000/api/ingest-file \
   -F "file=@./my-notes.md"
 ```
 
-### 2. Ask with RAG
+### Ask with RAG (streaming)
+
+Toggle **Use RAG** in the UI, or:
 
 ```bash
-curl -X POST http://localhost:8000/api/generate \
+curl -N -X POST http://localhost:8000/api/generate/stream \
   -H "Content-Type: application/json" \
-  -d '{"prompt": "What does the document say about X?", "use_rag": true}'
+  -d '{"prompt": "What is the capital of Morocco?", "use_rag": true}'
 ```
-
-Or use the interactive docs at `/docs` and set `use_rag: true`.
-
-Check how many documents are stored:
 
 ```bash
 curl http://localhost:8000/api/docs-count
@@ -104,7 +115,6 @@ cd backend
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 cp .env.example .env   # add OPENAI_API_KEY
-# Optional: run a local Chroma or point CHROMA_HOST/PORT
 uvicorn main:app --reload --port 8000
 ```
 
@@ -122,11 +132,11 @@ npm install && npm run dev
 
 ## Next steps
 
-- Better chunking & embeddings (OpenAI embeddings instead of Chroma defaults)
-- Streaming responses (SSE)
-- Agents (LangGraph / tool calling)
-- Auth, rate limits, observability
-- Production deployment (Vercel + Railway/Fly + managed vector DB)
+- Document upload dropzone in the UI
+- Multi-model router (OpenAI / Anthropic / Gemini)
+- PostgreSQL + persistent chat history
+- CI/CD (GitHub Actions)
+- Multi-stage production Dockerfiles
 
 ## License
 
