@@ -173,8 +173,41 @@ class RAGService:
         return overlapped
 
     async def split_async(self, text: str) -> list[str]:
-        """Run CPU-bound splitting off the event loop."""
-        return await asyncio.to_thread(self._split, text)
+        """
+        Run CPU-bound splitting off the event loop.
+
+        Raises
+        ------
+        ValueError
+            If ``text`` is empty/whitespace-only or exceeds the hard size limit.
+        RuntimeError
+            If chunking fails unexpectedly inside the worker thread.
+        """
+        if text is None:
+            raise ValueError("text must not be None")
+        if not isinstance(text, str):
+            raise TypeError(f"text must be str, got {type(text).__name__}")
+        if not text.strip():
+            raise ValueError("text is empty or whitespace-only")
+
+        # Guard against pathological inputs that would exhaust memory
+        max_chars = int(os.getenv("CHUNK_MAX_CHARS", str(5_000_000)))
+        if len(text) > max_chars:
+            raise ValueError(
+                f"text length ({len(text):,}) exceeds CHUNK_MAX_CHARS ({max_chars:,})"
+            )
+
+        try:
+            chunks = await asyncio.to_thread(self._split, text)
+        except Exception as exc:
+            logger.exception("Chunking failed for text of length %d", len(text))
+            raise RuntimeError(f"Chunking failed: {exc}") from exc
+
+        if not chunks:
+            # _split already returns [] for blank input, but defend anyway
+            raise ValueError("Chunking produced no output")
+
+        return chunks
 
     # ------------------------------------------------------------------
     # Embeddings – async + batched
