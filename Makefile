@@ -1,4 +1,4 @@
-.PHONY: up down build logs restart clean health
+.PHONY: up down build logs restart clean health test
 
 up:
 	docker compose up --build -d
@@ -21,3 +21,6 @@ health:
 clean:
 	docker compose down -v --remove-orphans
 	rm -rf backend/uploads frontend/.next frontend/node_modules
+
+test:
+	cd backend && python -m pytest tests/ -v --tb=short
