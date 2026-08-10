@@ -3,7 +3,7 @@ import "./globals.css";
 
 export const metadata: Metadata = {
   title: "Modern AI Stack",
-  description: "FastAPI + OpenAI + Next.js chat assistant",
+  description: "Production-ready RAG chat with SSE streaming and document ingestion",
 };
 
 export default function RootLayout({
@@ -12,7 +12,7 @@ export default function RootLayout({
   children: React.ReactNode;
 }) {
   return (
-    <html lang="en">
+    <html lang="en" className="dark">
       <body className="antialiased">{children}</body>
     </html>
   );
