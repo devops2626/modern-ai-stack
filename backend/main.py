@@ -237,6 +237,8 @@ async def ingest_file(file: UploadFile = File(...)):
             "chunks": result["chunks"],
             "total_docs": result["total_docs"],
         }
+    except (ValueError, TypeError) as e:
+        raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         logger.exception("Ingest failed")
         raise HTTPException(status_code=500, detail=str(e))
