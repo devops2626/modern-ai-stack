@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, FormEvent, useRef, useEffect } from "react";
+import { useState, FormEvent, useRef, useEffect, useCallback } from "react";
 
 interface Message {
   role: "user" | "assistant";
@@ -15,12 +15,90 @@ export default function Home() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [useRag, setUseRag] = useState(false);
+  const [docsCount, setDocsCount] = useState<number | null>(null);
+  const [uploading, setUploading] = useState(false);
+  const [uploadMsg, setUploadMsg] = useState<string | null>(null);
+  const [dragOver, setDragOver] = useState(false);
+  const [showUpload, setShowUpload] = useState(false);
   const bottomRef = useRef<HTMLDivElement>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
 
   // Auto-scroll to latest message
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages, loading]);
+
+  // Fetch document count on mount and after uploads
+  const refreshDocsCount = useCallback(async () => {
+    try {
+      const res = await fetch(`${API_URL}/api/docs-count`);
+      if (res.ok) {
+        const data = await res.json();
+        setDocsCount(data.count ?? 0);
+      }
+    } catch {
+      // Chroma may not be up yet — ignore
+    }
+  }, []);
+
+  useEffect(() => {
+    refreshDocsCount();
+  }, [refreshDocsCount]);
+
+  const ingestFile = async (file: File) => {
+    const allowed = [".txt", ".md", ".markdown", ".csv", ".json"];
+    const ext = "." + (file.name.split(".").pop() || "").toLowerCase();
+    if (!allowed.includes(ext) && !file.type.startsWith("text/")) {
+      setUploadMsg("Only text / markdown files are supported for now.");
+      return;
+    }
+
+    setUploading(true);
+    setUploadMsg(null);
+    setError(null);
+
+    try {
+      const form = new FormData();
+      form.append("file", file);
+
+      const res = await fetch(`${API_URL}/api/ingest-file`, {
+        method: "POST",
+        body: form,
+      });
+
+      if (!res.ok) {
+        const errData = await res.json().catch(() => ({}));
+        throw new Error(errData.detail || `Upload failed (${res.status})`);
+      }
+
+      const data = await res.json();
+      setUploadMsg(
+        `Ingested “${data.filename}” → ${data.chunks} chunk${data.chunks === 1 ? "" : "s"} (total: ${data.total_docs})`
+      );
+      setDocsCount(data.total_docs);
+      // Auto-enable RAG after a successful upload
+      setUseRag(true);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : "Upload failed";
+      setUploadMsg(msg);
+    } finally {
+      setUploading(false);
+    }
+  };
+
+  const handleFileSelect = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (file) ingestFile(file);
+    // reset so the same file can be re-selected
+    e.target.value = "";
+  };
+
+  const handleDrop = (e: React.DragEvent) => {
+    e.preventDefault();
+    setDragOver(false);
+    const file = e.dataTransfer.files?.[0];
+    if (file) ingestFile(file);
+  };
 
   const handleSubmit = async (e: FormEvent) => {
     e.preventDefault();
@@ -61,7 +139,7 @@ export default function Home() {
 
         buffer += decoder.decode(value, { stream: true });
         const lines = buffer.split("\n");
-        buffer = lines.pop() || ""; // keep incomplete line
+        buffer = lines.pop() || "";
 
         for (const line of lines) {
           if (!line.startsWith("data: ")) continue;
@@ -86,9 +164,7 @@ export default function Home() {
             } else if (event.type === "error") {
               throw new Error(event.message || "Stream error");
             }
-            // "meta" and "done" are informational — no action needed
           } catch (parseErr) {
-            // ignore malformed JSON lines
             if (parseErr instanceof Error && parseErr.message !== "Stream error") {
               continue;
             }
@@ -99,7 +175,6 @@ export default function Home() {
     } catch (err) {
       const msg = err instanceof Error ? err.message : "Request failed";
       setError(msg);
-      // Remove the empty assistant placeholder on hard failure
       setMessages((prev) => {
         const last = prev[prev.length - 1];
         if (last?.role === "assistant" && last.content === "") {
@@ -114,28 +189,112 @@ export default function Home() {
 
   return (
     <main className="flex min-h-screen flex-col items-center justify-center p-6 bg-gray-50 text-gray-900">
-      <div className="w-full max-w-2xl bg-white rounded-2xl shadow-lg overflow-hidden flex flex-col h-[80vh]">
-        <header className="px-6 py-4 border-b bg-white flex items-center justify-between">
-          <div>
+      <div className="w-full max-w-2xl bg-white rounded-2xl shadow-lg overflow-hidden flex flex-col h-[85vh]">
+        {/* Header */}
+        <header className="px-6 py-4 border-b bg-white flex items-center justify-between gap-3">
+          <div className="min-w-0">
             <h1 className="text-xl font-bold tracking-tight">Modern AI Stack</h1>
-            <p className="text-sm text-gray-500">FastAPI + OpenAI + Next.js · SSE streaming</p>
+            <p className="text-sm text-gray-500 truncate">
+              FastAPI + OpenAI + Next.js · SSE · RAG
+            </p>
           </div>
-          <label className="flex items-center gap-2 text-sm text-gray-600 cursor-pointer select-none">
-            <input
-              type="checkbox"
-              checked={useRag}
-              onChange={(e) => setUseRag(e.target.checked)}
-              className="rounded border-gray-300 text-blue-600 focus:ring-blue-500"
-            />
-            Use RAG
-          </label>
+          <div className="flex items-center gap-3 shrink-0">
+            <button
+              type="button"
+              onClick={() => setShowUpload((v) => !v)}
+              className="text-sm px-3 py-1.5 rounded-lg border border-gray-200 hover:bg-gray-50 transition"
+            >
+              {showUpload ? "Hide upload" : "Upload docs"}
+            </button>
+            <label className="flex items-center gap-2 text-sm text-gray-600 cursor-pointer select-none">
+              <input
+                type="checkbox"
+                checked={useRag}
+                onChange={(e) => setUseRag(e.target.checked)}
+                className="rounded border-gray-300 text-blue-600 focus:ring-blue-500"
+              />
+              Use RAG
+              {docsCount !== null && (
+                <span className="text-xs text-gray-400">({docsCount})</span>
+              )}
+            </label>
+          </div>
         </header>
 
+        {/* Upload panel */}
+        {showUpload && (
+          <div className="px-6 py-4 border-b bg-gray-50">
+            <div
+              onDragOver={(e) => {
+                e.preventDefault();
+                setDragOver(true);
+              }}
+              onDragLeave={() => setDragOver(false)}
+              onDrop={handleDrop}
+              onClick={() => fileInputRef.current?.click()}
+              className={`
+                relative flex flex-col items-center justify-center gap-2
+                rounded-xl border-2 border-dashed px-4 py-8 cursor-pointer transition
+                ${
+                  dragOver
+                    ? "border-blue-500 bg-blue-50"
+                    : "border-gray-300 hover:border-gray-400 hover:bg-white"
+                }
+                ${uploading ? "opacity-60 pointer-events-none" : ""}
+              `}
+            >
+              <input
+                ref={fileInputRef}
+                type="file"
+                accept=".txt,.md,.markdown,.csv,.json,text/*"
+                className="hidden"
+                onChange={handleFileSelect}
+              />
+              {uploading ? (
+                <p className="text-sm text-gray-500 animate-pulse">Uploading & ingesting…</p>
+              ) : (
+                <>
+                  <p className="text-sm font-medium text-gray-700">
+                    Drop a file here or click to browse
+                  </p>
+                  <p className="text-xs text-gray-400">
+                    .txt · .md · .csv · .json
+                  </p>
+                </>
+              )}
+            </div>
+
+            {uploadMsg && (
+              <p
+                className={`mt-3 text-sm ${
+                  uploadMsg.toLowerCase().includes("ingest") ||
+                  uploadMsg.toLowerCase().includes("chunk")
+                    ? "text-green-600"
+                    : "text-red-600"
+                }`}
+              >
+                {uploadMsg}
+              </p>
+            )}
+
+            {docsCount !== null && docsCount > 0 && (
+              <p className="mt-2 text-xs text-gray-500">
+                Vector store has <strong>{docsCount}</strong> chunk
+                {docsCount === 1 ? "" : "s"}. Toggle “Use RAG” to query them.
+              </p>
+            )}
+          </div>
+        )}
+
+        {/* Messages */}
         <div className="flex-1 overflow-y-auto p-6 space-y-4">
           {messages.length === 0 && (
-            <p className="text-center text-gray-400 mt-12">
-              Ask anything — responses stream in real time…
-            </p>
+            <div className="text-center text-gray-400 mt-12 space-y-2">
+              <p>Ask anything — responses stream in real time.</p>
+              <p className="text-sm">
+                Upload documents and enable <strong>Use RAG</strong> to chat with your files.
+              </p>
+            </div>
           )}
           {messages.map((m, i) => (
             <div
@@ -152,7 +311,6 @@ export default function Home() {
                 }`}
               >
                 {m.content}
-                {/* Blinking cursor while the last assistant message is still streaming */}
                 {loading &&
                   i === messages.length - 1 &&
                   m.role === "assistant" && (
@@ -170,6 +328,7 @@ export default function Home() {
           </div>
         )}
 
+        {/* Input */}
         <form
           onSubmit={handleSubmit}
           className="p-4 border-t bg-white flex gap-3"
@@ -179,7 +338,11 @@ export default function Home() {
             rows={2}
             value={prompt}
             onChange={(e) => setPrompt(e.target.value)}
-            placeholder="Ask something…"
+            placeholder={
+              useRag && docsCount
+                ? "Ask about your documents…"
+                : "Ask something…"
+            }
             disabled={loading}
             onKeyDown={(e) => {
               if (e.key === "Enter" && !e.shiftKey) {
