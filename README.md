@@ -18,19 +18,48 @@ modern-ai-stack/
 ├── backend/
 │   ├── main.py
 │   ├── requirements.txt
+│   ├── Dockerfile
 │   ├── .env.example
 │   └── services/          # (extend with RAG, agents, etc.)
 ├── frontend/
 │   ├── src/app/page.tsx
 │   ├── package.json
+│   ├── Dockerfile
 │   └── ...
+├── docker-compose.yml
 ├── .gitignore
 └── README.md
 ```
 
 ## Quick Start
 
-### 1. Backend
+### Option A — Docker Compose (recommended)
+
+1. Create your backend env file:
+
+```bash
+cp backend/.env.example backend/.env
+# Edit backend/.env and add your OPENAI_API_KEY
+```
+
+2. Start everything:
+
+```bash
+docker compose up --build
+```
+
+- Frontend: http://localhost:3000  
+- Backend API: http://localhost:8000  
+- API docs: http://localhost:8000/docs  
+
+Stop with `Ctrl+C` or `docker compose down`.
+
+> The backend mounts the local `./backend` folder so code changes are reflected (uvicorn `--reload`).  
+> Frontend also mounts the source for hot reload.
+
+### Option B — Manual (without Docker)
+
+#### Backend
 
 ```bash
 cd backend
@@ -41,10 +70,7 @@ cp .env.example .env        # add your OPENAI_API_KEY
 uvicorn main:app --reload --host 0.0.0.0 --port 8000
 ```
 
-API available at `http://localhost:8000`  
-Docs: `http://localhost:8000/docs`
-
-### 2. Frontend
+#### Frontend
 
 ```bash
 cd frontend
@@ -59,6 +85,7 @@ Open `http://localhost:3000`
 - Clean FastAPI backend with CORS, Pydantic models, proper error handling
 - OpenAI `gpt-4o-mini` (easy to swap)
 - Next.js + Tailwind chat UI with loading states and basic conversation history
+- **Docker Compose** for one-command local development
 - Ready for RAG (add Chroma / Pinecone + document ingestion)
 - Environment variable safety (`.env.example`)
 - Git-friendly structure and ignore rules
@@ -70,7 +97,7 @@ Open `http://localhost:3000`
 - **Streaming**: Switch to Server-Sent Events / streaming responses
 - **Guardrails**: Structured output + validation (Pydantic / NeMo)
 - **Auth & Rate limiting**: Add JWT / API keys and rate limits
-- **Deployment**: Dockerize backend, deploy frontend to Vercel, backend to Railway/Fly/AWS
+- **Deployment**: Use the included Dockerfiles; deploy frontend to Vercel, backend to Railway/Fly/AWS
 
 ## License
 
