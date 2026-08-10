@@ -30,7 +30,7 @@ logger = logging.getLogger("main")
 app = FastAPI(
     title="Modern AI Stack API",
     description="FastAPI + SSE streaming + RAG (Chroma) + document upload",
-    version="1.3.0",
+    version="1.4.0",
 )
 
 app.add_middleware(
@@ -63,6 +63,9 @@ DEFAULT_SYSTEM = (
 )
 
 
+# ---------------------------------------------------------------------------
+# Schemas
+# ---------------------------------------------------------------------------
 class ChatMessage(BaseModel):
     role: str = Field(..., pattern="^(user|assistant|system)$")
     content: str
@@ -82,13 +85,16 @@ class QueryResponse(BaseModel):
     context_used: bool = False
 
 
-def build_messages(request: QueryRequest) -> tuple[list[dict[str, str]], bool]:
+# ---------------------------------------------------------------------------
+async def build_messages(
+    request: QueryRequest,
+) -> tuple[list[dict[str, str]], bool]:
     context_used = False
     user_content = request.prompt
 
     if request.use_rag:
         rag = get_rag()
-        docs = rag.retrieve(request.prompt, k=request.k)
+        docs = await rag.retrieve(request.prompt, k=request.k)
         ctx = rag.build_context(docs)
         if ctx:
             user_content = (
@@ -102,6 +108,7 @@ def build_messages(request: QueryRequest) -> tuple[list[dict[str, str]], bool]:
         {"role": "system", "content": request.system or DEFAULT_SYSTEM},
     ]
 
+    # Keep last ~8 turns
     for msg in request.history[-16:]:
         if msg.role in ("user", "assistant"):
             messages.append({"role": msg.role, "content": msg.content})
@@ -110,12 +117,15 @@ def build_messages(request: QueryRequest) -> tuple[list[dict[str, str]], bool]:
     return messages, context_used
 
 
+# ---------------------------------------------------------------------------
+# Routes
+# ---------------------------------------------------------------------------
 @app.get("/health")
 async def health():
     rag = get_rag()
     return {
         "status": "ok",
-        "version": "1.3.0",
+        "version": "1.4.0",
         "model": MODEL,
         "chroma": "connected" if rag.available else "unavailable",
         "docs": rag.count() if rag.available else 0,
@@ -136,7 +146,7 @@ async def generate_text(request: QueryRequest):
     if not os.getenv("OPENAI_API_KEY"):
         raise HTTPException(status_code=500, detail="OPENAI_API_KEY is not configured")
 
-    messages, context_used = build_messages(request)
+    messages, context_used = await build_messages(request)
 
     try:
         response = client.chat.completions.create(
@@ -157,7 +167,7 @@ async def event_generator(request: QueryRequest) -> AsyncGenerator[str, None]:
         yield f"data: {json.dumps({'type': 'error', 'message': 'OPENAI_API_KEY is not configured'})}\n\n"
         return
 
-    messages, context_used = build_messages(request)
+    messages, context_used = await build_messages(request)
 
     yield f"data: {json.dumps({'type': 'meta', 'model': MODEL, 'context_used': context_used})}\n\n"
 
@@ -202,7 +212,7 @@ async def ingest_text(texts: List[str]):
 
     total_chunks = 0
     for i, t in enumerate(texts):
-        result = rag.ingest(t, source=f"text_{i}")
+        result = await rag.ingest(t, source=f"text_{i}")
         total_chunks += result["chunks"]
     return {"ingested": total_chunks, "total_docs": rag.count()}
 
@@ -221,7 +231,7 @@ async def ingest_file(file: UploadFile = File(...)):
         raise HTTPException(status_code=400, detail="Empty file")
 
     try:
-        result = rag.ingest(content, source=file.filename)
+        result = await rag.ingest(content, source=file.filename)
         return {
             "filename": file.filename,
             "chunks": result["chunks"],
@@ -245,7 +255,7 @@ async def reset_kb():
 async def root():
     return {
         "name": "Modern AI Stack API",
-        "version": "1.3.0",
+        "version": "1.4.0",
         "docs": "/docs",
         "health": "/health",
     }
