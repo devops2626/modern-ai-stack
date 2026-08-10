@@ -1,101 +1,79 @@
-import os
-import json
-from typing import Optional, List, AsyncGenerator
+"""
+Modern AI Stack – FastAPI backend
+SSE streaming · RAG (Chroma + OpenAI embeddings) · document ingest · chat history
+"""
 
-from fastapi import FastAPI, HTTPException, UploadFile, File
+from __future__ import annotations
+
+import json
+import logging
+import os
+from typing import Any, AsyncGenerator, List, Optional
+
+from dotenv import load_dotenv
+from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
+from openai import AsyncOpenAI, OpenAI, OpenAIError
 from pydantic import BaseModel, Field
-from openai import OpenAI, OpenAIError, AsyncOpenAI
-from dotenv import load_dotenv
+
+from services.rag import get_rag
 
 load_dotenv()
 
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)-7s | %(name)s | %(message)s",
+)
+logger = logging.getLogger("main")
+
 app = FastAPI(
     title="Modern AI Stack API",
-    description="FastAPI backend with SSE streaming + optional RAG (Chroma)",
-    version="1.2.0",
+    description="FastAPI + SSE streaming + RAG (Chroma) + document upload",
+    version="1.3.0",
 )
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "http://127.0.0.1:3000", "*"],
+    allow_origins=[
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+        "http://frontend:3000",
+        "*",
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Sync client kept for non-streaming / ingest paths
-client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-# Async client for streaming
-async_client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+client = OpenAI(
+    api_key=os.getenv("OPENAI_API_KEY"),
+    base_url=os.getenv("OPENAI_BASE_URL") or None,
+)
+async_client = AsyncOpenAI(
+    api_key=os.getenv("OPENAI_API_KEY"),
+    base_url=os.getenv("OPENAI_BASE_URL") or None,
+)
 MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 
-# --- Optional Chroma client (lazy) ---
-_chroma_client = None
-_collection = None
-
-def get_chroma():
-    """Connect to Chroma running in Docker (or local). Returns (client, collection) or (None, None)."""
-    global _chroma_client, _collection
-    if _collection is not None:
-        return _chroma_client, _collection
-    try:
-        import chromadb
-
-        host = os.getenv("CHROMA_HOST", "localhost")
-        port = int(os.getenv("CHROMA_PORT", "8001"))
-
-        # Inside docker-compose the service name is "chroma" and listens on 8000
-        if host == "chroma":
-            port = 8000
-
-        _chroma_client = chromadb.HttpClient(host=host, port=port)
-        _collection = _chroma_client.get_or_create_collection(
-            name="docs",
-            metadata={"hnsw:space": "cosine"},
-        )
-        return _chroma_client, _collection
-    except Exception as e:
-        print(f"[Chroma] not available: {e}")
-        return None, None
+DEFAULT_SYSTEM = (
+    "You are a precise, helpful AI assistant. "
+    "When context from the knowledge base is provided, use it and cite sources with [n] markers. "
+    "If the context is insufficient, say so and answer from general knowledge."
+)
 
 
-def build_user_content(prompt: str, use_rag: bool) -> tuple[str, bool]:
-    """Optionally augment the prompt with retrieved context."""
-    context_used = False
-    user_content = prompt
-
-    if use_rag:
-        _, collection = get_chroma()
-        if collection is not None:
-            try:
-                results = collection.query(
-                    query_texts=[prompt],
-                    n_results=min(4, max(1, collection.count() or 1)),
-                )
-                docs = results.get("documents", [[]])[0]
-                if docs:
-                    context = "\n\n---\n\n".join(docs)
-                    user_content = (
-                        "Use the following context to answer the question. "
-                        "If the context is insufficient, say so.\n\n"
-                        f"Context:\n{context}\n\nQuestion: {prompt}"
-                    )
-                    context_used = True
-            except Exception as e:
-                print(f"[RAG] query failed: {e}")
-
-    return user_content, context_used
+class ChatMessage(BaseModel):
+    role: str = Field(..., pattern="^(user|assistant|system)$")
+    content: str
 
 
 class QueryRequest(BaseModel):
     prompt: str = Field(..., min_length=1, max_length=8000)
-    system: Optional[str] = Field(
-        default="You are a helpful AI assistant built on a modern custom stack.",
-        max_length=2000,
-    )
-    use_rag: bool = Field(default=False, description="Retrieve relevant context from the vector store")
+    system: Optional[str] = Field(default=None, max_length=2000)
+    use_rag: bool = Field(default=False)
+    history: List[ChatMessage] = Field(default_factory=list)
+    k: int = Field(default=4, ge=1, le=12)
 
 
 class QueryResponse(BaseModel):
@@ -104,34 +82,67 @@ class QueryResponse(BaseModel):
     context_used: bool = False
 
 
+def build_messages(request: QueryRequest) -> tuple[list[dict[str, str]], bool]:
+    context_used = False
+    user_content = request.prompt
+
+    if request.use_rag:
+        rag = get_rag()
+        docs = rag.retrieve(request.prompt, k=request.k)
+        ctx = rag.build_context(docs)
+        if ctx:
+            user_content = (
+                "Use the following context to answer the question. "
+                "Cite sources using the [n] markers when you use them.\n\n"
+                f"Context:\n{ctx}\n\n---\n\nQuestion: {request.prompt}"
+            )
+            context_used = True
+
+    messages: list[dict[str, str]] = [
+        {"role": "system", "content": request.system or DEFAULT_SYSTEM},
+    ]
+
+    for msg in request.history[-16:]:
+        if msg.role in ("user", "assistant"):
+            messages.append({"role": msg.role, "content": msg.content})
+
+    messages.append({"role": "user", "content": user_content})
+    return messages, context_used
+
+
 @app.get("/health")
 async def health():
-    _, collection = get_chroma()
-    chroma_ok = collection is not None
+    rag = get_rag()
     return {
         "status": "ok",
+        "version": "1.3.0",
         "model": MODEL,
-        "chroma": "connected" if chroma_ok else "unavailable",
+        "chroma": "connected" if rag.available else "unavailable",
+        "docs": rag.count() if rag.available else 0,
         "streaming": True,
     }
 
 
-# ---------- Non-streaming (kept for compatibility / Swagger) ----------
+@app.get("/api/docs-count")
+async def docs_count():
+    rag = get_rag()
+    if not rag.available:
+        return {"count": 0, "chroma": "unavailable"}
+    return {"count": rag.count(), "chroma": "connected"}
+
+
 @app.post("/api/generate", response_model=QueryResponse)
 async def generate_text(request: QueryRequest):
     if not os.getenv("OPENAI_API_KEY"):
         raise HTTPException(status_code=500, detail="OPENAI_API_KEY is not configured")
 
-    user_content, context_used = build_user_content(request.prompt, request.use_rag)
+    messages, context_used = build_messages(request)
 
     try:
         response = client.chat.completions.create(
             model=MODEL,
-            messages=[
-                {"role": "system", "content": request.system},
-                {"role": "user", "content": user_content},
-            ],
-            temperature=0.7,
+            messages=messages,
+            temperature=0.3,
         )
         content = response.choices[0].message.content or ""
         return QueryResponse(reply=content, model=MODEL, context_used=context_used)
@@ -141,38 +152,27 @@ async def generate_text(request: QueryRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-# ---------- SSE Streaming ----------
 async def event_generator(request: QueryRequest) -> AsyncGenerator[str, None]:
-    """Yield Server-Sent Events as the model generates tokens."""
     if not os.getenv("OPENAI_API_KEY"):
-        yield f"data: {json.dumps({'error': 'OPENAI_API_KEY is not configured'})}\n\n"
+        yield f"data: {json.dumps({'type': 'error', 'message': 'OPENAI_API_KEY is not configured'})}\n\n"
         return
 
-    user_content, context_used = build_user_content(request.prompt, request.use_rag)
+    messages, context_used = build_messages(request)
 
-    # First event: metadata
     yield f"data: {json.dumps({'type': 'meta', 'model': MODEL, 'context_used': context_used})}\n\n"
 
     try:
         stream = await async_client.chat.completions.create(
             model=MODEL,
-            messages=[
-                {"role": "system", "content": request.system},
-                {"role": "user", "content": user_content},
-            ],
-            temperature=0.7,
+            messages=messages,
+            temperature=0.3,
             stream=True,
         )
-
         async for chunk in stream:
             delta = chunk.choices[0].delta if chunk.choices else None
             if delta and delta.content:
-                # Each token as its own SSE event
                 yield f"data: {json.dumps({'type': 'token', 'content': delta.content})}\n\n"
-
-        # Done signal
         yield f"data: {json.dumps({'type': 'done'})}\n\n"
-
     except OpenAIError as e:
         yield f"data: {json.dumps({'type': 'error', 'message': str(e)})}\n\n"
     except Exception as e:
@@ -181,66 +181,77 @@ async def event_generator(request: QueryRequest) -> AsyncGenerator[str, None]:
 
 @app.post("/api/generate/stream")
 async def generate_stream(request: QueryRequest):
-    """Stream tokens via Server-Sent Events (text/event-stream)."""
     return StreamingResponse(
         event_generator(request),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",
             "Connection": "keep-alive",
-            "X-Accel-Buffering": "no",  # disable nginx buffering if present
+            "X-Accel-Buffering": "no",
         },
     )
 
 
-# ---------- Ingest endpoints ----------
 @app.post("/api/ingest")
 async def ingest_text(texts: List[str]):
-    """Ingest plain text chunks into the vector store."""
-    _, collection = get_chroma()
-    if collection is None:
+    rag = get_rag()
+    if not rag.available:
         raise HTTPException(status_code=503, detail="Chroma is not available")
-
     if not texts:
         raise HTTPException(status_code=400, detail="No texts provided")
 
-    ids = [f"doc_{collection.count() + i}" for i in range(len(texts))]
-    collection.add(documents=texts, ids=ids)
-    return {"ingested": len(texts), "total_docs": collection.count()}
+    total_chunks = 0
+    for i, t in enumerate(texts):
+        result = rag.ingest(t, source=f"text_{i}")
+        total_chunks += result["chunks"]
+    return {"ingested": total_chunks, "total_docs": rag.count()}
 
 
 @app.post("/api/ingest-file")
 async def ingest_file(file: UploadFile = File(...)):
-    """Ingest a plain-text or markdown file."""
-    _, collection = get_chroma()
-    if collection is None:
+    rag = get_rag()
+    if not rag.available:
         raise HTTPException(status_code=503, detail="Chroma is not available")
 
-    content = (await file.read()).decode("utf-8", errors="ignore")
-    chunks = [c.strip() for c in content.split("\n\n") if c.strip()]
-    if not chunks:
-        chunks = [content[:4000]] if content.strip() else []
+    if not file.filename:
+        raise HTTPException(status_code=400, detail="No filename")
 
-    if not chunks:
+    content = (await file.read()).decode("utf-8", errors="ignore")
+    if not content.strip():
         raise HTTPException(status_code=400, detail="Empty file")
 
-    ids = [f"file_{file.filename}_{collection.count() + i}" for i in range(len(chunks))]
-    collection.add(documents=chunks, ids=ids)
+    try:
+        result = rag.ingest(content, source=file.filename)
+        return {
+            "filename": file.filename,
+            "chunks": result["chunks"],
+            "total_docs": result["total_docs"],
+        }
+    except Exception as e:
+        logger.exception("Ingest failed")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.delete("/api/kb")
+async def reset_kb():
+    rag = get_rag()
+    if not rag.available:
+        raise HTTPException(status_code=503, detail="Chroma is not available")
+    rag.reset()
+    return {"ok": True, "message": "Knowledge base cleared"}
+
+
+@app.get("/")
+async def root():
     return {
-        "filename": file.filename,
-        "chunks": len(chunks),
-        "total_docs": collection.count(),
+        "name": "Modern AI Stack API",
+        "version": "1.3.0",
+        "docs": "/docs",
+        "health": "/health",
     }
-
-
-@app.get("/api/docs-count")
-async def docs_count():
-    _, collection = get_chroma()
-    if collection is None:
-        return {"count": 0, "chroma": "unavailable"}
-    return {"count": collection.count(), "chroma": "connected"}
 
 
 if __name__ == "__main__":
     import uvicorn
+
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
