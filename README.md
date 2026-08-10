@@ -8,7 +8,7 @@ A clean, production-oriented blueprint for building an end-to-end AI application
 |-------|-----------|-------------------|--------|
 | 1. Foundation | LLM Provider | OpenAI, Anthropic, Google Gemini | Core intelligence |
 | 2. Infrastructure | Backend & Compute | FastAPI, Docker, Vercel/AWS | API, business logic, hosting |
-| 3. Integration | Orchestration & Data | LangChain / LlamaIndex, Chroma / Postgres | RAG, memory, tools |
+| 3. Integration | Orchestration & Data | LangChain / LlamaIndex, **Chroma** | RAG, memory, tools |
 | 4. Application | UI | Next.js, React, Tailwind | Chat UX, streaming, feedback |
 
 ## Project Structure
@@ -20,20 +20,18 @@ modern-ai-stack/
 │   ├── requirements.txt
 │   ├── Dockerfile
 │   ├── .env.example
-│   └── services/          # (extend with RAG, agents, etc.)
+│   └── ...
 ├── frontend/
 │   ├── src/app/page.tsx
 │   ├── package.json
 │   ├── Dockerfile
 │   └── ...
-├── docker-compose.yml
+├── docker-compose.yml      # backend + frontend + Chroma
 ├── .gitignore
 └── README.md
 ```
 
-## Quick Start
-
-### Option A — Docker Compose (recommended)
+## Quick Start (Docker Compose — recommended)
 
 1. Create your backend env file:
 
@@ -42,62 +40,93 @@ cp backend/.env.example backend/.env
 # Edit backend/.env and add your OPENAI_API_KEY
 ```
 
-2. Start everything:
+2. Start the full stack (API + UI + vector DB):
 
 ```bash
 docker compose up --build
 ```
 
-- Frontend: http://localhost:3000  
-- Backend API: http://localhost:8000  
-- API docs: http://localhost:8000/docs  
+| Service   | URL                          |
+|-----------|------------------------------|
+| Frontend  | http://localhost:3000        |
+| Backend   | http://localhost:8000        |
+| API docs  | http://localhost:8000/docs   |
+| Chroma    | http://localhost:8001        |
 
 Stop with `Ctrl+C` or `docker compose down`.
 
-> The backend mounts the local `./backend` folder so code changes are reflected (uvicorn `--reload`).  
-> Frontend also mounts the source for hot reload.
+> Source is volume-mounted → hot reload works for both backend and frontend.  
+> Chroma data is persisted in a Docker volume (`chroma_data`).
 
-### Option B — Manual (without Docker)
+## RAG / Document Q&A
 
-#### Backend
+The backend talks to the Chroma container automatically.
+
+### 1. Ingest documents
+
+**Plain text chunks** (Swagger or curl):
+
+```bash
+curl -X POST http://localhost:8000/api/ingest \
+  -H "Content-Type: application/json" \
+  -d '["Your first document paragraph.", "Another relevant chunk of knowledge."]'
+```
+
+**Upload a .txt / .md file**:
+
+```bash
+curl -X POST http://localhost:8000/api/ingest-file \
+  -F "file=@./my-notes.md"
+```
+
+### 2. Ask with RAG
+
+```bash
+curl -X POST http://localhost:8000/api/generate \
+  -H "Content-Type: application/json" \
+  -d '{"prompt": "What does the document say about X?", "use_rag": true}'
+```
+
+Or use the interactive docs at `/docs` and set `use_rag: true`.
+
+Check how many documents are stored:
+
+```bash
+curl http://localhost:8000/api/docs-count
+```
+
+## Manual setup (without Docker)
+
+### Backend
 
 ```bash
 cd backend
-python -m venv .venv
-source .venv/bin/activate   # or .venv\Scripts\activate on Windows
+python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
-cp .env.example .env        # add your OPENAI_API_KEY
-uvicorn main:app --reload --host 0.0.0.0 --port 8000
+cp .env.example .env   # add OPENAI_API_KEY
+# Optional: run a local Chroma or point CHROMA_HOST/PORT
+uvicorn main:app --reload --port 8000
 ```
 
-#### Frontend
+### Frontend
 
 ```bash
 cd frontend
-npm install
-npm run dev
+npm install && npm run dev
 ```
 
-Open `http://localhost:3000`
+## Security notes
 
-## Features in this improved version
+- `.env` files are already in `.gitignore` — never commit API keys.
+- In production, tighten CORS origins and add authentication / rate limiting.
 
-- Clean FastAPI backend with CORS, Pydantic models, proper error handling
-- OpenAI `gpt-4o-mini` (easy to swap)
-- Next.js + Tailwind chat UI with loading states and basic conversation history
-- **Docker Compose** for one-command local development
-- Ready for RAG (add Chroma / Pinecone + document ingestion)
-- Environment variable safety (`.env.example`)
-- Git-friendly structure and ignore rules
+## Next steps
 
-## Next Steps (Production)
-
-- **RAG**: Ingest PDFs / docs into a vector store and retrieve context before calling the LLM
-- **Agents**: LangGraph or CrewAI for multi-step tool use
-- **Streaming**: Switch to Server-Sent Events / streaming responses
-- **Guardrails**: Structured output + validation (Pydantic / NeMo)
-- **Auth & Rate limiting**: Add JWT / API keys and rate limits
-- **Deployment**: Use the included Dockerfiles; deploy frontend to Vercel, backend to Railway/Fly/AWS
+- Better chunking & embeddings (OpenAI embeddings instead of Chroma defaults)
+- Streaming responses (SSE)
+- Agents (LangGraph / tool calling)
+- Auth, rate limits, observability
+- Production deployment (Vercel + Railway/Fly + managed vector DB)
 
 ## License
 
